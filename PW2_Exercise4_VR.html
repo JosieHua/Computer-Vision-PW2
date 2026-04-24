@@ -17,8 +17,9 @@
 </head>
 <body>
 
-<div id="info">LEFT: Video Plane | RIGHT: Elevation Map (Lambertian Lighting)</div>
-<div class="status" id="status">Initializing...</div>
+<strong>LEFT: Source Video | RIGHT: Elevation Map</strong><br>
+  <strong>Exercise 3: Lambertian Lighting on Elevation Maps</strong><br>
+<div class="status" id="status">Space: RGB | Lighting: Active</div>
 
 <script async src="https://unpkg.com/es-module-shims@1.3.6/dist/es-module-shims.js"></script>
 <script type="importmap">
@@ -38,15 +39,14 @@ import { VRButton } from 'three/addons/webxr/VRButton.js';
 import { HTMLMesh } from 'three/addons/interactive/HTMLMesh.js';
 import { InteractiveGroup } from 'three/addons/interactive/InteractiveGroup.js';
 
-/* =========================================================
-    GLOBAL CONFIGURATION
-========================================================= */
 const CONFIG = {
-    resolution: 120,    
-    heightScale: 0.5    
+    resolution: 120,   // how dense the grid is (more = smoother but heavier)
+    heightScale: 0.3   // how much we exaggerate the elevation
 };
 
+// list of supported color spaces
 const SPACES = ['RGB','HSV','CIEXYZ','CIExyY','CIELab','CIELCH'];
+
 
 let scene, camera, renderer, controls;
 let video, videoTexture;
@@ -60,22 +60,32 @@ function init(){
     scene.background = new THREE.Color(0x050510);
 
     camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.1, 100);
-    camera.position.set(0, 1.5, 3.5); 
+
+    // front-facing view this time 
+    camera.position.set(0, 0, 4); 
 
     renderer = new THREE.WebGLRenderer({antialias:true});
     renderer.setSize(innerWidth, innerHeight);
-    renderer.xr.enabled = true;
     document.body.appendChild(renderer.domElement);
+
+    // enable XR
+    renderer.xr.enabled = true;
+
+    // add VR button
     document.body.appendChild(VRButton.createButton(renderer));
 
+    // orbit controls for quick inspection
     controls = new OrbitControls(camera, renderer.domElement);
 
+
+    // video setup (used as dynamic texture)
     video = document.createElement('video');
-    video.src = "video.mp4";
+    video.src = "video.mp4"; // make sure path is correct
     video.loop = true;
     video.muted = true;
     video.crossOrigin = "anonymous";
 
+    // wait until video is ready before building the scene
     video.onloadeddata = () => {
         videoTexture = new THREE.VideoTexture(video);
         setupObjects(); 
@@ -87,13 +97,14 @@ function init(){
         video.play();
         renderer.setAnimationLoop(animate);
     };
+    
 }
 
-/* =========================================================
-    GPU KERNELS (SHADERS)
-========================================================= */
+// SHADER PIPELINE
+//all color conversions handled on GPU
 function setupObjects(){
 
+// conversion helpers (standard formulas)
 const GLSL = `
 vec3 rgb2hsv(vec3 c){
     vec4 K = vec4(0., -1./3., 2./3., -1.);
@@ -145,20 +156,22 @@ vec3 normalizeSpace(vec3 v, int s){
 }
 `;
 
-/* =========================================================
-    ELEVATION MESH (Exercise 2 + 3)
-========================================================= */
+//ELEVATION + LIGHTING
+
 elevationMaterial = new THREE.ShaderMaterial({
 uniforms:{
     uVideo:{value:videoTexture},
     uHeight:{value:CONFIG.heightScale},
     uSpace:{value:0},
     uChannel:{value:0},
-    uLightDir: { value: new THREE.Vector3(1,1,1).normalize() },
-    uLightColor: { value: new THREE.Vector3(1,1,1) },
-    uKd: { value: 1.0 },
-    uKa: { value: 0.15 }
+
+    // simple lighting params
+    uLightDir: { value: new THREE.Vector3(1, 1, 1).normalize() },
+    uLightColor: { value: new THREE.Vector3(1, 1, 1) },
+    uKd: { value: 1.0 },  // diffuse strength
+    uKa: { value: 0.15 }  // ambient base light
 },
+
 vertexShader:`
 uniform sampler2D uVideo;
 uniform float uHeight;
@@ -209,72 +222,122 @@ void main(){
 side:THREE.DoubleSide
 });
 
+// mesh grid that gets deformed + lit
 const elevGeo = new THREE.PlaneGeometry(1.6, 1, CONFIG.resolution, CONFIG.resolution);
+
 elevationMesh = new THREE.Mesh(elevGeo, elevationMaterial);
-// 放在右边
-elevationMesh.position.set(0.9, 1.2, -2);
+
+// put it in the right 
+elevationMesh.position.set(1.5, 1, -2); 
+
 scene.add(elevationMesh);
 
-/* =========================================================
-    REFERENCE VIDEO PLANE
-========================================================= */
+// ORIGINAL VIDEO as a reference
 const vp = new THREE.Mesh(
     new THREE.PlaneGeometry(1.6, 1),
     new THREE.MeshBasicMaterial({map:videoTexture})
 );
-// 放在左边
-vp.position.set(-0.9, 1.2, -2);
+// left side = original input
+vp.position.set(-1.5, 1, -2);
 scene.add(vp);
 }
 
-/* =========================================================
-    VR UI LAYER
-========================================================= */
+//VR UI LAYER
 function setupGUI(group){
+    // create lil-gui panel
     const gui = new GUI();
 
-    const vCtrl = { pause: () => video.paused ? video.play() : video.pause() };
+    // quick video control (just toggle play/pause)
+    const vCtrl = { 
+        pause: () => video.paused ? video.play() : video.pause() 
+    };
     gui.add(vCtrl, 'pause').name('⏯ Play/Pause');
 
+    // --- color space selection ---
+    // instead of dropdown, using buttons (one per space)
     const spaceFolder = gui.addFolder('Color Spaces');
+
     SPACES.forEach((name, index) => {
         const obj = {};
+
+        // each button switches the shader uniform
         obj[name] = () => {
             colorSpace.current = name;
+
+            // tell shader which space to use
             elevationMaterial.uniforms.uSpace.value = index;
-            updateStatus();
+
+            updateStatus(); // update text display
         };
+
         spaceFolder.add(obj, name);
     });
+
     spaceFolder.open();
 
+    // --- elevation channel selection ---
+    // choose which component (x/y/z) becomes height
     const chanFolder = gui.addFolder('Elevation Channel');
+
     ['CH 1', 'CH 2', 'CH 3'].forEach((name, index) => {
         const obj = {};
+
         obj[name] = () => {
             elevationMaterial.uniforms.uChannel.value = index;
         };
+
         chanFolder.add(obj, name);
     });
+
     chanFolder.open();
 
-    gui.add(CONFIG, 'heightScale', 0.1, 2.0).name('Height')
-    .onChange(v => { elevationMaterial.uniforms.uHeight.value = v; });
+    // --- height scaling ---
+    // controls how "tall" the surface looks
+    gui.add(CONFIG, 'heightScale', 0.1, 2.0)
+        .name('Height')
+        .onChange(v => {
+            elevationMaterial.uniforms.uHeight.value = v;
+        });
 
-    gui.add(elevationMaterial.uniforms.uKd, 'value', 0, 2).name("Diffuse");
-    gui.add(elevationMaterial.uniforms.uKa, 'value', 0, 1).name("Ambient");
+    // --- lighting params ---
+    // basic Lambert controls (diffuse + ambient)
+    gui.add(elevationMaterial.uniforms.uKd, 'value', 0, 2)
+        .name("Diffuse");
 
+    gui.add(elevationMaterial.uniforms.uKa, 'value', 0, 1)
+        .name("Ambient");
+
+    // --- attach GUI to 3D world (for VR) ---
+    // turns HTML panel into a 3D object
     const guiMesh = new HTMLMesh(gui.domElement);
-    guiMesh.position.set(0, 1.2, -0.8); 
+
+    // position it in front of the user
+    guiMesh.position.set(0, 1.5, -0.8);
+
+    // scale up so it's readable in VR
     guiMesh.scale.setScalar(2.5);
+
     group.add(guiMesh);
 
-    // VR Controllers
+    // --- VR controllers ---
+    // simple laser pointer for interaction
     for (let i = 0; i < 2; i++) {
+
         const c = renderer.xr.getController(i);
-        c.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0), new THREE.Vector3(0,0,-5)]), new THREE.LineBasicMaterial({color:0x00ff00})));
+
+        // draw a line forward (like a ray)
+        const line = new THREE.Line(
+            new THREE.BufferGeometry().setFromPoints([
+                new THREE.Vector3(0,0,0),
+                new THREE.Vector3(0,0,-5)
+            ]),
+            new THREE.LineBasicMaterial({color:0x00ff00})
+        );
+
+        c.add(line);
+
         scene.add(c);
-        group.add(c);
+        group.add(c); // attach to same group as GUI
     }
 }
 
