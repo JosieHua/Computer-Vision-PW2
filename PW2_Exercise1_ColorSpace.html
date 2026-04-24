@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Exercise: Color Cloud Visualization</title>
+  <style>
+    body { margin:0; overflow:hidden; font-family: monospace; background:#000; }
+    #info {
+        position:absolute;
+        bottom:20px;
+        left:20px;
+        color:white;
+        background:rgba(0,0,0,0.7);
+        padding:8px 12px;
+        border-radius:6px;
+        font-size:11px;
+    }
+    .status {
+        position:absolute;
+        top:20px;
+        right:20px;
+        color:#0f0;
+        background:rgba(0,0,0,0.6);
+        padding:5px 10px;
+        border-radius:5px;
+        font-size:10px;
+    }
+  </style>
+</head>
+<body>
+
+<div id="info">
+  LEFT: Video Reference | RIGHT: Color Cloud Rendering
+</div>
+<div class="status" id="status">Space: RGB</div>
+
+<script async src="https://unpkg.com/es-module-shims@1.3.6/dist/es-module-shims.js"></script>
+<script type="importmap">
+{
+ "imports": {
+   "three": "https://unpkg.com/three@0.183.0/build/three.module.js",
+   "three/addons/": "https://unpkg.com/three@0.183.0/examples/jsm/"
+ }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GUI } from "three/addons/libs/lil-gui.module.min.js";
+
+/* =========================================================
+   CONFIGURATION
+========================================================= */
+const CONFIG = {
+    pointSize: 2.0,
+    resolution: 80
+};
+
+const SPACES = ['RGB','HSV','CIEXYZ','CIExyY','CIELab','CIELCH'];
+const AXIS_LABELS = {
+    RGB: ['R','G','B'],
+    HSV: ['H','S','V'],
+    CIEXYZ: ['X','Y','Z'],
+    CIExyY: ['x','y','Y'],
+    CIELab: ['L','a','b'],
+    CIELCH: ['L','C','H']
+};
+
+/* =========================================================
+   GLOBAL VARIABLES
+========================================================= */
+let scene, camera, renderer, controls;
+let video, videoTexture;
+
+let pointCloud, pointMaterial;
+let axisLabels = [];
+let colorSpace = { current: 'RGB' };
+
+/* =========================================================
+   INIT
+========================================================= */
+init();
+
+function init(){
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x050510);
+
+    camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.1, 100);
+    camera.position.set(2.5, 2, 4);
+
+    renderer = new THREE.WebGLRenderer({antialias:true});
+    renderer.setSize(innerWidth, innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    controls = new OrbitControls(camera, renderer.domElement);
+
+    video = document.createElement('video');
+    video.src = "video.mp4"; // 确保该视频文件存在
+    video.loop = true;
+    video.muted = true;
+
+    video.onloadeddata = () => {
+        videoTexture = new THREE.VideoTexture(video);
+        setupObjects();
+        setupGUI();
+        updateAxisLabels();
+        video.play();
+        animate();
+    };
+}
+
+/* =========================================================
+   AXIS LABELS & SPRITES
+========================================================= */
+function createTextSprite(text){
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+    canvas.width = 128; canvas.height = 64;
+    ctx.fillStyle = "white";
+    ctx.font = "28px monospace";
+    ctx.fillText(text, 10, 40);
+
+    const tex = new THREE.CanvasTexture(canvas);
+    const mat = new THREE.SpriteMaterial({ map: tex });
+    const sprite = new THREE.Sprite(mat);
+    sprite.scale.set(0.3,0.15,1);
+    return sprite;
+}
+
+function updateAxisLabels(){
+    axisLabels.forEach(l => scene.remove(l));
+    axisLabels = [];
+    const labels = AXIS_LABELS[colorSpace.current];
+    const positions = [
+        new THREE.Vector3(1.2,-1,-1), 
+        new THREE.Vector3(-1,1.2,-1), 
+        new THREE.Vector3(-1,-1,1.2) 
+    ];
+
+    for(let i=0;i<3;i++){
+        const label = createTextSprite(labels[i]);
+        label.position.copy(pointCloud.position).add(positions[i]);
+        scene.add(label);
+        axisLabels.push(label);
+    }
+}
+
+function addCloudAxes(){
+    const size = 2.2;
+    const createAxis = (dir, color) => {
+        const geo = new THREE.BufferGeometry().setFromPoints([
+            new THREE.Vector3(0,0,0),
+            dir.clone().multiplyScalar(size)
+        ]);
+        const line = new THREE.Line(geo, new THREE.LineBasicMaterial({
+            color, transparent:true, opacity:0.6
+        }));
+        line.position.copy(pointCloud.position).add(new THREE.Vector3(-1,-1,-1));
+        scene.add(line);
+    };
+    createAxis(new THREE.Vector3(1,0,0), 0xff4444);
+    createAxis(new THREE.Vector3(0,1,0), 0x44ff44);
+    createAxis(new THREE.Vector3(0,0,1), 0x4444ff);
+}
+
+/* =========================================================
+   GPU SHADER PIPELINE
+========================================================= */
+function setupObjects(){
+
+const GLSL = `
+vec3 rgb2hsv(vec3 c){
+    vec4 K = vec4(0., -1./3., 2./3., -1.);
+    vec4 p = mix(vec4(c.bg, K.wz), vec4(c.gb, K.xy), step(c.b,c.g));
+    vec4 q = mix(vec4(p.xyw,c.r), vec4(c.r,p.yzx), step(p.x,c.r));
+    float d = q.x - min(q.w,q.y);
+    float e = 1e-10;
+    return vec3(abs(q.z + (q.w-q.y)/(6.*d+e)), d/(q.x+e), q.x);
+}
+
+vec3 rgb2xyz(vec3 c){
+    c = mix(c/12.92, pow((c+0.055)/1.055, vec3(2.4)), step(0.04045,c));
+    return vec3(
+        dot(c, vec3(0.4124,0.3576,0.1805)),
+        dot(c, vec3(0.2126,0.7152,0.0722)),
+        dot(c, vec3(0.0193,0.1192,0.9505))
+    );
+}
+
+vec3 xyz2xyY(vec3 xyz){
+    float sum = xyz.x + xyz.y + xyz.z;
+    if(sum == 0.0) return vec3(0.0,0.0,xyz.y);
+    return vec3(xyz.x/sum, xyz.y/sum, xyz.y);
+}
+
+float fLab(float t){
+    return t > 0.008856 ? pow(t,1.0/3.0) : (7.787*t + 16.0/116.0);
+}
+
+vec3 xyz2lab(vec3 xyz){
+    vec3 ref = vec3(0.95047,1.0,1.08883);
+    vec3 v = vec3(fLab(xyz.x/ref.x), fLab(xyz.y/ref.y), fLab(xyz.z/ref.z));
+    return vec3(116.0*v.y - 16.0, 500.0*(v.x - v.y), 200.0*(v.y - v.z));
+}
+
+vec3 lab2lch(vec3 lab){
+    float C = length(lab.yz);
+    float H = atan(lab.z, lab.y);
+    if(H < 0.0) H += 6.2831853;
+    H /= 6.2831853;
+    return vec3(lab.x, C, H);
+}
+
+vec3 convert(vec3 rgb, int s){
+    if(s==0) return rgb;
+    if(s==1) return rgb2hsv(rgb);
+    vec3 xyz = rgb2xyz(rgb);
+    if(s==2) return xyz;
+    if(s==3) return xyz2xyY(xyz);
+    vec3 lab = xyz2lab(xyz);
+    if(s==4) return lab;
+    if(s==5) return lab2lch(lab);
+    return rgb;
+}
+
+vec3 normalizeSpace(vec3 v, int s){
+    if(s==0 || s==1) return v;
+    if(s==2) return v / vec3(0.95,1.0,1.1);
+    if(s==3) return v / vec3(0.8,0.9,1.0);
+    if(s==4) return vec3(v.x/100.0,(v.y+128.0)/255.0,(v.z+128.0)/255.0);
+    if(s==5) return vec3(v.x/100.0,v.y/150.0,v.z);
+    return v;
+}
+`;
+
+/* =========================================================
+   POINT CLOUD (color-space embedding)
+========================================================= */
+pointMaterial = new THREE.ShaderMaterial({
+uniforms:{
+    uVideo:{value:videoTexture},
+    uSpace:{value:0}
+},
+vertexShader:`
+uniform sampler2D uVideo;
+uniform int uSpace;
+varying vec3 vColor;
+${GLSL}
+void main(){
+    vec3 rgb = texture2D(uVideo, uv).rgb;
+    vec3 v = convert(rgb, uSpace);
+    vec3 n = normalizeSpace(v, uSpace);
+    vec3 pos = n * 2.0 - 1.0;
+    vColor = rgb;
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(pos,1.0);
+    gl_PointSize = ${CONFIG.pointSize.toFixed(1)};
+}`,
+fragmentShader:`
+varying vec3 vColor;
+void main(){
+    gl_FragColor = vec4(vColor,1.0);
+}`,
+transparent:true
+});
+
+const pGeo = new THREE.PlaneGeometry(1,1,CONFIG.resolution,CONFIG.resolution);
+pointCloud = new THREE.Points(pGeo, pointMaterial);
+pointCloud.position.set(0.8,0.2,0);
+scene.add(pointCloud);
+
+addCloudAxes();
+
+/* =========================================================
+   VIDEO PLANE (reference view)
+========================================================= */
+const vp = new THREE.Mesh(
+    new THREE.PlaneGeometry(1.6,1),
+    new THREE.MeshBasicMaterial({map:videoTexture})
+);
+vp.position.set(-1.3, 0.2, 0); // 调整位置使其居中
+scene.add(vp);
+}
+
+/* =========================================================
+   GUI CONTROLS
+========================================================= */
+function setupGUI(){
+    const gui = new GUI();
+    const ctrl = {
+        pause: () => video.paused ? video.play() : video.pause(),
+        seek: () => video.currentTime += 10
+    };
+    gui.add(ctrl,'pause').name('⏯ Pause/Play');
+    gui.add(ctrl,'seek').name('⏩ +10 Sec');
+
+    gui.add(colorSpace,'current',SPACES).name('🎨 Space')
+    .onChange(v=>{
+        const i = SPACES.indexOf(v);
+        pointMaterial.uniforms.uSpace.value = i;
+        updateAxisLabels();
+        updateStatus();
+    });
+}
+
+function updateStatus(){
+    document.getElementById('status').innerText = `Space: ${colorSpace.current}`;
+}
+
+function animate(){
+    requestAnimationFrame(animate);
+    controls.update();
+    renderer.render(scene,camera);
+}
+</script>
+</body>
+</html>
