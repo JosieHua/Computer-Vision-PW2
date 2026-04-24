@@ -18,7 +18,8 @@
 </head>
 <body>
 
-<div id="info">LEFT: Source Video | RIGHT: Elevation Map with Lambertian Lighting</div>
+<strong>LEFT: Source Video | RIGHT: Elevation Map</strong><br>
+  <strong>Exercise 3: Lambertian Lighting on Elevation Maps</strong><br>
 <div class="status" id="status">Space: RGB | Lighting: Active</div>
 
 <script async src="https://unpkg.com/es-module-shims@1.3.6/dist/es-module-shims.js"></script>
@@ -32,25 +33,28 @@
 </script>
 
 <script type="module">
+
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GUI } from "three/addons/libs/lil-gui.module.min.js";
 
-/* =========================================================
-   CONFIGURATION
-========================================================= */
 const CONFIG = {
-    resolution: 128,    // 顶点密度
-    heightScale: 0.6    // 高度缩放系数
+    resolution: 120,   // how dense the grid is (more = smoother but heavier)
+    heightScale: 0.3   // how much we exaggerate the elevation
 };
 
+// list of supported color spaces
 const SPACES = ['RGB','HSV','CIEXYZ','CIExyY','CIELab','CIELCH'];
 
+// basic globals (keeping it simple)
 let scene, camera, renderer, controls;
+
 let video, videoTexture;
+
 let elevationMesh, elevationMaterial;
+
 let colorSpace = { current: 'RGB' };
-let elevChannel = 0;
+let elevChannel = 0; // which component we use as height
 
 init();
 
@@ -59,33 +63,40 @@ function init(){
     scene.background = new THREE.Color(0x050510);
 
     camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.1, 100);
+
+    // front-facing view this time 
     camera.position.set(0, 0, 4); 
 
     renderer = new THREE.WebGLRenderer({antialias:true});
     renderer.setSize(innerWidth, innerHeight);
     document.body.appendChild(renderer.domElement);
 
+    // orbit controls for quick inspection
     controls = new OrbitControls(camera, renderer.domElement);
 
+    // video setup (used as dynamic texture)
     video = document.createElement('video');
-    video.src = "video.mp4"; 
+    video.src = "video.mp4"; // make sure path is correct
     video.loop = true;
     video.muted = true;
 
+    // wait until video is ready before building the scene
     video.onloadeddata = () => {
         videoTexture = new THREE.VideoTexture(video);
+
         setupObjects();
         setupGUI();
+
         video.play();
         animate();
     };
 }
 
-/* =========================================================
-   GPU SHADER PIPELINE
-========================================================= */
+// SHADER PIPELINE
+//all color conversions handled on GPU
 function setupObjects(){
 
+// conversion helpers (standard formulas)
 const GLSL = `
 vec3 rgb2hsv(vec3 c){
     vec4 K = vec4(0., -1./3., 2./3., -1.);
@@ -95,38 +106,56 @@ vec3 rgb2hsv(vec3 c){
     float e = 1e-10;
     return vec3(abs(q.z + (q.w-q.y)/(6.*d+e)), d/(q.x+e), q.x);
 }
+
 vec3 rgb2xyz(vec3 c){
     c = mix(c/12.92, pow((c+0.055)/1.055, vec3(2.4)), step(0.04045,c));
-    return vec3(dot(c, vec3(0.4124,0.3576,0.1805)), dot(c, vec3(0.2126,0.7152,0.0722)), dot(c, vec3(0.0193,0.1192,0.9505)));
+    return vec3(
+        dot(c, vec3(0.4124,0.3576,0.1805)),
+        dot(c, vec3(0.2126,0.7152,0.0722)),
+        dot(c, vec3(0.0193,0.1192,0.9505))
+    );
 }
+
 vec3 xyz2xyY(vec3 xyz){
     float sum = xyz.x + xyz.y + xyz.z;
     if(sum == 0.0) return vec3(0.0,0.0,xyz.y);
     return vec3(xyz.x/sum, xyz.y/sum, xyz.y);
 }
-float fLab(float t){ return t > 0.008856 ? pow(t,1.0/3.0) : (7.787*t + 16.0/116.0); }
+
+float fLab(float t){
+    return t > 0.008856 ? pow(t,1.0/3.0) : (7.787*t + 16.0/116.0);
+}
+
 vec3 xyz2lab(vec3 xyz){
     vec3 ref = vec3(0.95047,1.0,1.08883);
     vec3 v = vec3(fLab(xyz.x/ref.x), fLab(xyz.y/ref.y), fLab(xyz.z/ref.z));
     return vec3(116.0*v.y - 16.0, 500.0*(v.x - v.y), 200.0*(v.y - v.z));
 }
+
 vec3 lab2lch(vec3 lab){
     float C = length(lab.yz);
     float H = atan(lab.z, lab.y);
     if(H < 0.0) H += 6.2831853;
     return vec3(lab.x, C, H / 6.2831853);
 }
+
+// pick which color space to use
 vec3 convert(vec3 rgb, int s){
     if(s==0) return rgb;
     if(s==1) return rgb2hsv(rgb);
+
     vec3 xyz = rgb2xyz(rgb);
     if(s==2) return xyz;
     if(s==3) return xyz2xyY(xyz);
+
     vec3 lab = xyz2lab(xyz);
     if(s==4) return lab;
     if(s==5) return lab2lch(lab);
+
     return rgb;
 }
+
+// normalize everything so values behave nicely
 vec3 normalizeSpace(vec3 v, int s){
     if(s==0 || s==1) return v;
     if(s==2) return v / vec3(0.95,1.0,1.1);
@@ -137,19 +166,20 @@ vec3 normalizeSpace(vec3 v, int s){
 }
 `;
 
-/* =========================================================
-   ELEVATION MESH WITH LAMBERTIAN LIGHTING
-========================================================= */
+//ELEVATION + LIGHTING
+
 elevationMaterial = new THREE.ShaderMaterial({
 uniforms:{
     uVideo:{value:videoTexture},
     uHeight:{value:CONFIG.heightScale},
     uSpace:{value:0},
     uChannel:{value:0},
+
+    // simple lighting params
     uLightDir: { value: new THREE.Vector3(1, 1, 1).normalize() },
     uLightColor: { value: new THREE.Vector3(1, 1, 1) },
-    uKd: { value: 1.0 }, // Diffuse factor
-    uKa: { value: 0.15 } // Ambient factor
+    uKd: { value: 1.0 },  // diffuse strength
+    uKa: { value: 0.15 }  // ambient base light
 },
 vertexShader:`
 uniform sampler2D uVideo;
@@ -164,93 +194,125 @@ varying float vLighting;
 ${GLSL}
 
 void main(){
+    // small offset for sampling neighbors
     float delta = 1.0 / ${CONFIG.resolution.toFixed(1)};
 
-    // 1. Current position & color
+    // current pixel
     vec3 rgb = texture2D(uVideo, uv).rgb;
+
+    // height from selected channel
     float h = normalizeSpace(convert(rgb, uSpace), uSpace)[uChannel];
 
-    // 2. Finite Differences for Normal Calculation
-    // Sample 4 neighbors
+    // --- estimate normal using neighbors (finite differences) ---
     float hL = normalizeSpace(convert(texture2D(uVideo, uv + vec2(-delta, 0.0)).rgb, uSpace), uSpace)[uChannel];
     float hR = normalizeSpace(convert(texture2D(uVideo, uv + vec2(delta, 0.0)).rgb, uSpace), uSpace)[uChannel];
     float hD = normalizeSpace(convert(texture2D(uVideo, uv + vec2(0.0, -delta)).rgb, uSpace), uSpace)[uChannel];
     float hU = normalizeSpace(convert(texture2D(uVideo, uv + vec2(0.0, delta)).rgb, uSpace), uSpace)[uChannel];
 
-    // Compute surface gradient (incorporating heightScale)
+    // gradient -> how steep the surface is
     float dzdx = (hR - hL) * uHeight;
     float dzdy = (hU - hD) * uHeight;
 
-    // Normal vector N = normalize(-dz/dx, -dz/dy, 1)
+    // build normal from gradient
     vec3 N = normalize(vec3(-dzdx, -dzdy, 1.0));
     vec3 L = normalize(uLightDir);
 
-    // Lambertian component (max(0, N.L))
+    // classic Lambert: max(dot(N,L), 0)
     vLighting = max(dot(N, L), 0.0);
+
     vColor = rgb;
 
+    // displace vertex
     vec3 pos = position;
     pos.z = h * uHeight;
+
     gl_Position = projectionMatrix * modelViewMatrix * vec4(pos,1.0);
-}`,
+}
+`,
 fragmentShader:`
 uniform vec3 uLightColor;
 uniform float uKd;
 uniform float uKa;
+
 varying vec3 vColor;
 varying float vLighting;
 
 void main(){
-    // Final Color = Color * (Ambient + Diffuse * Lighting)
+    // ambient + diffuse lighting
     vec3 lightIntensity = uLightColor * (uKa + uKd * vLighting);
+
+    // modulate original color
     gl_FragColor = vec4(vColor * lightIntensity, 1.0);
-}`,
+}
+`,
 side:THREE.DoubleSide
 });
 
+// mesh grid that gets deformed + lit
 const elevGeo = new THREE.PlaneGeometry(1.6, 1, CONFIG.resolution, CONFIG.resolution);
+
 elevationMesh = new THREE.Mesh(elevGeo, elevationMaterial);
+
+// put it in the right 
 elevationMesh.position.set(0.9, 0, 0); 
+
 scene.add(elevationMesh);
 
-/* =========================================================
-   REFERENCE VIDEO PLANE
-========================================================= */
+// ORIGINAL VIDEO as a reference
 const vp = new THREE.Mesh(
     new THREE.PlaneGeometry(1.6, 1),
     new THREE.MeshBasicMaterial({map:videoTexture})
 );
+
+// left side = original input
 vp.position.set(-0.9, 0, 0);
+
 scene.add(vp);
 }
 
-/* =========================================================
-   UI CONTROLS
-========================================================= */
+//GUI
 function setupGUI(){
     const gui = new GUI();
-    const ctrl = { pause: () => video.paused ? video.play() : video.pause() };
+
+    const ctrl = {
+        pause: () => video.paused ? video.play() : video.pause()
+    };
     
     gui.add(ctrl,'pause').name('⏯ Pause/Play');
 
-    gui.add(colorSpace, 'current', SPACES).name('🎨 Color Space').onChange(v => {
+    // change color space
+    gui.add(colorSpace, 'current', SPACES)
+    .name('Color Space')
+    .onChange(v => {
         elevationMaterial.uniforms.uSpace.value = SPACES.indexOf(v);
         updateStatus();
     });
 
-    gui.add({ch:0}, 'ch', {CH_1:0, CH_2:1, CH_3:2}).name('🔢 Channel').onChange(v => {
+    // choose which component controls height
+    gui.add({ch:0}, 'ch', {CH_1:0, CH_2:1, CH_3:2})
+    .name('Channel')
+    .onChange(v => {
         elevChannel = v;
         elevationMaterial.uniforms.uChannel.value = v;
         updateStatus();
     });
 
-    gui.add(CONFIG, 'heightScale', 0.1, 2.0).name('📏 Height Scale').onChange(v => {
+    // tweak elevation strength
+    gui.add(CONFIG, 'heightScale', 0.1, 2.0)
+    .name('Height Scale')
+    .onChange(v => {
         elevationMaterial.uniforms.uHeight.value = v;
     });
 
-    const fLight = gui.addFolder('💡 Lighting Settings');
-    fLight.add(elevationMaterial.uniforms.uKd, 'value', 0, 2).name('Diffuse (kd)');
-    fLight.add(elevationMaterial.uniforms.uKa, 'value', 0, 1).name('Ambient (ka)');
+    // lighting controls
+    const fLight = gui.addFolder('Lighting Settings');
+
+    fLight.add(elevationMaterial.uniforms.uKd, 'value', 0, 2)
+        .name('Diffuse (kd)');
+
+    fLight.add(elevationMaterial.uniforms.uKa, 'value', 0, 1)
+        .name('Ambient (ka)');
+
     fLight.open();
 }
 
@@ -259,12 +321,15 @@ function updateStatus(){
         `Space: ${colorSpace.current} | Channel: ${elevChannel}`;
 }
 
+// LOOP
 function animate(){
     requestAnimationFrame(animate);
+
     controls.update();
     renderer.render(scene, camera);
 }
 
+//resize available
 window.addEventListener('resize', () => {
     camera.aspect = innerWidth / innerHeight;
     camera.updateProjectionMatrix();
